@@ -10,19 +10,13 @@ MODE="${1:-dev}"
 export API_PORT="${API_PORT:-8787}"
 export WEB_PORT="${WEB_PORT:-3000}"
 
-# The level is built with Solana 4.1.2. Prefer that release if it is installed
-# next to an older active one.
-SOLANA_BIN="${SOLANA_BIN:-$HOME/.local/share/solana/install/releases/4.1.2/solana-release/bin}"
-if [ -d "$SOLANA_BIN" ]; then
-  export PATH="$SOLANA_BIN:$PATH"
-fi
-if ! command -v cargo-build-sbf >/dev/null; then
-  echo "cargo-build-sbf not found. Install the Solana CLI 4.1.2 first." >&2
+if ! command -v docker >/dev/null; then
+  echo "Docker CLI not found. Install Docker and build the sandbox image (see README.md)." >&2
   exit 1
 fi
 
 if [ "$MODE" != "--prod" ]; then
-  (cd backend && cargo build --release -p api -p grader)
+  (cd backend && cargo build --release --locked -p api)
   (cd frontend && bun install --silent)
 fi
 

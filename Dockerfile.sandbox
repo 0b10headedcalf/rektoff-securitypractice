@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1
+# Build the application image first; it already contains trusted, warm SBF builds.
+ARG BASE_IMAGE=rektoff-practice:latest
+FROM ${BASE_IMAGE}
+USER root
+RUN mkdir -p /opt/programs \
+ && for level in /app/backend/levels/*; do \
+      mv "$level/program" "/opt/programs/$(basename "$level")"; \
+    done \
+ && mv /app/bin/grader /opt/grader \
+ && tools="$(find /home/app/.cache/solana -path '*/platform-tools/rust/bin' -type d)" \
+ && test "$(printf '%s\n' "$tools" | wc -l)" -eq 1 \
+ && ln -s "$tools" /opt/sbf-bin \
+ && rm -f /usr/local/bin/docker /usr/bin/docker /usr/bin/dockerd /usr/bin/containerd \
+ && rm -rf /app /home/app/.work \
+ && mkdir -p /work \
+ && chown app:app /work
+COPY backend/sandbox/worker.sh /usr/local/bin/sandbox-worker
+RUN chmod 0555 /usr/local/bin/sandbox-worker
+USER app
+WORKDIR /work
+ENV CARGO_HOME=/work/cargo \
+    RUSTC=/opt/sbf-bin/rustc \
+    PATH=/opt/sbf-bin:$PATH \
+    CARGO_NET_OFFLINE=true \
+    CARGO_CACHE_AUTO_CLEAN_FREQUENCY=never
+# Prewarm using the SAME paths, environment, and compiler as submissions.
+# Moving Cargo artifacts to a different build path otherwise invalidates them.
+RUN set -eu; \
+    for program in /opt/programs/*; do \
+      /usr/local/bin/sandbox-worker build "$(basename "$program")" < "$program/src/lib.rs" > /dev/null; \
+      rm -rf "$program/target"; \
+      cp -a /work/program/target "$program/target"; \
+      rm -rf /work/program /work/cargo; \
+    done
+# Independent lifetime bound as well as the controller's shorter phase deadlines.
+ENTRYPOINT ["/usr/bin/timeout", "--signal=KILL", "90", "/usr/local/bin/sandbox-worker"]
+CMD []

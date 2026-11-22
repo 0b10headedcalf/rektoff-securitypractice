@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,10 +18,13 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::WatchStream;
 use tokio_stream::{Stream, StreamExt};
+
+mod sandbox;
+
+use sandbox::Sandbox;
 
 const MAX_SOURCE_BYTES: usize = 64 * 1024;
 const MAX_COMPILE_ERROR_BYTES: usize = 8 * 1024;
@@ -34,8 +36,6 @@ const JOB_RETENTION: Duration = Duration::from_secs(600);
 struct Level {
     description: String,
     source: String,
-    /// Private copy of the program crate where submissions are compiled.
-    work_dir: PathBuf,
 }
 
 struct Job {
@@ -78,10 +78,10 @@ struct JobState {
 }
 
 struct App {
+    sandbox: Option<Arc<Sandbox>>,
     levels: HashMap<String, Level>,
     jobs: Mutex<HashMap<String, (Instant, watch::Receiver<JobState>)>>,
     queue: mpsc::Sender<Job>,
-    grader: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -116,8 +116,14 @@ async fn list_levels(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
         .levels
         .iter()
         .map(|(id, level)| {
-            let heading = level.description.lines().find_map(|line| line.strip_prefix("# "));
-            LevelSummary { id, title: heading.unwrap_or(id) }
+            let heading = level
+                .description
+                .lines()
+                .find_map(|line| line.strip_prefix("# "));
+            LevelSummary {
+                id,
+                title: heading.unwrap_or(id),
+            }
         })
         .collect();
     levels.sort_by_key(|level| level.id);
@@ -128,8 +134,15 @@ async fn get_level(
     State(app): State<Arc<App>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let level = app.levels.get(&id).ok_or((StatusCode::NOT_FOUND, "unknown level"))?;
-    let body = LevelResponse { id: &id, description: &level.description, source: &level.source };
+    let level = app
+        .levels
+        .get(&id)
+        .ok_or((StatusCode::NOT_FOUND, "unknown level"))?;
+    let body = LevelResponse {
+        id: &id,
+        description: &level.description,
+        source: &level.source,
+    };
     Ok(Json(serde_json::to_value(body).expect("level serializes")))
 }
 
@@ -137,6 +150,16 @@ async fn submit(
     State(app): State<Arc<App>>,
     Json(request): Json<SubmitRequest>,
 ) -> Result<Json<SubmitResponse>, ApiError> {
+    if !app
+        .sandbox
+        .as_ref()
+        .is_some_and(|sandbox| sandbox.available())
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "submissions are unavailable because the sandbox is not ready",
+        ));
+    }
     if !app.levels.contains_key(&request.level) {
         return Err((StatusCode::NOT_FOUND, "unknown level"));
     }
@@ -153,9 +176,12 @@ async fn submit(
         enqueued: Instant::now(),
         state,
     };
-    app.queue
-        .try_send(job)
-        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "queue is full, try again shortly"))?;
+    app.queue.try_send(job).map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "queue is full, try again shortly",
+        )
+    })?;
 
     let mut jobs = app.jobs.lock().expect("jobs lock");
     jobs.retain(|_, (created, _)| created.elapsed() < JOB_RETENTION);
@@ -165,7 +191,9 @@ async fn submit(
 
 fn job_receiver(app: &App, id: &str) -> Result<watch::Receiver<JobState>, ApiError> {
     let jobs = app.jobs.lock().expect("jobs lock");
-    jobs.get(id).map(|(_, rx)| rx.clone()).ok_or((StatusCode::NOT_FOUND, "unknown job"))
+    jobs.get(id)
+        .map(|(_, rx)| rx.clone())
+        .ok_or((StatusCode::NOT_FOUND, "unknown job"))
 }
 
 async fn get_job(
@@ -193,67 +221,41 @@ async fn job_events(
             keep
         })
         .map(|state| {
-            let name = if state.stage == Stage::Done { "done" } else { "status" };
+            let name = if state.stage == Stage::Done {
+                "done"
+            } else {
+                "status"
+            };
             let data = serde_json::to_string(&state).expect("state serializes");
             Ok(Event::default().event(name).data(data))
         });
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(5))))
 }
 
-/// A command that sees only the environment it needs, so `env!()` in a
-/// submission cannot read anything else from the server's environment.
-fn sandboxed_command(program: &str) -> Command {
-    let mut command = Command::new(program);
-    command.env_clear().kill_on_drop(true).stdin(Stdio::null());
-    for key in ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "CARGO_NET_OFFLINE"] {
-        if let Ok(value) = env::var(key) {
-            command.env(key, value);
-        }
-    }
-    command
-}
-
 struct BuildFailure(String);
 
-/// Compiles the program in `work_dir` and returns the path of the fresh `.so`.
-async fn build(work_dir: &Path, source: &str) -> Result<PathBuf, BuildFailure> {
-    let deploy_dir = work_dir.join("target/deploy");
-    let io = |e: std::io::Error| BuildFailure(format!("server error: {e}"));
-
-    // Remove old artifacts first so a failed build can never be graded as the
-    // previous player's program.
-    if let Ok(mut entries) = tokio::fs::read_dir(&deploy_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry.path().extension().is_some_and(|ext| ext == "so") {
-                tokio::fs::remove_file(entry.path()).await.map_err(io)?;
-            }
-        }
-    }
-    tokio::fs::write(work_dir.join("src/lib.rs"), source).await.map_err(io)?;
-
-    let run = sandboxed_command("cargo-build-sbf")
-        .current_dir(work_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
-    let output = match tokio::time::timeout(BUILD_TIMEOUT, run).await {
-        Err(_) => return Err(BuildFailure("build timed out".into())),
-        Ok(result) => result.map_err(io)?,
-    };
-    if !output.status.success() {
+async fn build(sandbox: &Sandbox, level: &str, source: &str) -> Result<Vec<u8>, BuildFailure> {
+    let output = sandbox
+        .run("build", level, source.as_bytes(), BUILD_TIMEOUT)
+        .await
+        .map_err(BuildFailure)?;
+    if !output.success {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let start = stderr.len().saturating_sub(MAX_COMPILE_ERROR_BYTES);
-        let start = (start..=stderr.len()).find(|&i| stderr.is_char_boundary(i)).unwrap_or(0);
-        return Err(BuildFailure(stderr[start..].to_string()));
+        let start = (start..=stderr.len())
+            .find(|&i| stderr.is_char_boundary(i))
+            .unwrap_or(0);
+        let message = if stderr.is_empty() {
+            "sandbox build failed"
+        } else {
+            &stderr[start..]
+        };
+        return Err(BuildFailure(message.to_string()));
     }
-
-    let mut entries = tokio::fs::read_dir(&deploy_dir).await.map_err(io)?;
-    while let Some(entry) = entries.next_entry().await.map_err(io)? {
-        if entry.path().extension().is_some_and(|ext| ext == "so") {
-            return Ok(entry.path());
-        }
+    if !output.stdout.starts_with(b"\x7fELF") {
+        return Err(BuildFailure("build produced no program".into()));
     }
-    Err(BuildFailure("build produced no program".into()))
+    Ok(output.stdout)
 }
 
 #[derive(Deserialize)]
@@ -269,24 +271,28 @@ struct GraderReport {
     checks: Vec<GraderCheck>,
 }
 
-async fn grade(grader: &Path, level: &str, program: &Path) -> Result<GraderReport, String> {
-    let run = sandboxed_command(&grader.to_string_lossy())
-        .arg(level)
-        .arg(program)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
-    let output = tokio::time::timeout(TEST_TIMEOUT, run)
-        .await
-        .map_err(|_| "tests timed out".to_string())?
-        .map_err(|e| format!("could not start grader: {e}"))?;
+async fn grade(sandbox: &Sandbox, level: &str, program: &[u8]) -> Result<GraderReport, String> {
+    let output = sandbox.run("grade", level, program, TEST_TIMEOUT).await?;
+    if !output.success {
+        return Err(format!(
+            "sandbox grader failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let line = stdout.lines().last().unwrap_or_default();
     serde_json::from_str(line).map_err(|e| format!("bad grader output: {e}"))
 }
 
 async fn run_job(app: &App, job: Job) {
-    let level = &app.levels[&job.level];
+    let Some(sandbox) = app.sandbox.as_deref().filter(|sandbox| sandbox.available()) else {
+        job.state.send_modify(|s| {
+            s.stage = Stage::Done;
+            s.passed = Some(false);
+            s.error = Some("the sandbox is unavailable, please try again later".into());
+        });
+        return;
+    };
     let queue_ms = job.enqueued.elapsed().as_millis() as u64;
     job.state.send_modify(|s| {
         s.stage = Stage::Building;
@@ -294,7 +300,7 @@ async fn run_job(app: &App, job: Job) {
     });
 
     let started = Instant::now();
-    let built = build(&level.work_dir, &job.source).await;
+    let built = build(sandbox, &job.level, &job.source).await;
     let build_ms = started.elapsed().as_millis() as u64;
     let program = match built {
         Ok(program) => program,
@@ -305,7 +311,10 @@ async fn run_job(app: &App, job: Job) {
                 s.passed = Some(false);
                 s.compile_error = Some(message);
             });
-            println!("job {} level={} queue={queue_ms}ms build={build_ms}ms result=build-failed", job.id, job.level);
+            println!(
+                "job {} level={} queue={queue_ms}ms build={build_ms}ms result=build-failed",
+                job.id, job.level
+            );
             return;
         }
     };
@@ -315,12 +324,15 @@ async fn run_job(app: &App, job: Job) {
     });
 
     let started = Instant::now();
-    let graded = grade(&app.grader, &job.level, &program).await;
+    let graded = grade(sandbox, &job.level, &program).await;
     let test_ms = started.elapsed().as_millis() as u64;
     match graded {
         Ok(report) => {
             for check in report.checks.iter().filter(|c| !c.passed) {
-                println!("job {} check failed: {:?}: {:?}", job.id, check.name, check.detail);
+                println!(
+                    "job {} check failed: {:?}: {:?}",
+                    job.id, check.name, check.detail
+                );
             }
             println!(
                 "job {} level={} queue={queue_ms}ms build={build_ms}ms test={test_ms}ms passed={}",
@@ -333,7 +345,11 @@ async fn run_job(app: &App, job: Job) {
                 s.checks = report
                     .checks
                     .into_iter()
-                    .map(|c| CheckOutcome { name: c.name, passed: c.passed, detail: c.detail })
+                    .map(|c| CheckOutcome {
+                        name: c.name,
+                        passed: c.passed,
+                        detail: c.detail,
+                    })
                     .collect();
             });
         }
@@ -349,11 +365,13 @@ async fn run_job(app: &App, job: Job) {
     }
 }
 
-/// Copies each level's program crate into the work directory and compiles the
-/// original source once, so the first player does not pay for a cold build.
-async fn load_levels(levels_dir: &Path, work_root: &Path) -> HashMap<String, Level> {
+/// Source and descriptions are served by the API. All compilation and its
+/// prewarming happen in the sandbox image build, never on the API host.
+async fn load_levels(levels_dir: &Path) -> HashMap<String, Level> {
     let mut levels = HashMap::new();
-    let mut entries = tokio::fs::read_dir(levels_dir).await.expect("LEVELS_DIR is readable");
+    let mut entries = tokio::fs::read_dir(levels_dir)
+        .await
+        .expect("LEVELS_DIR is readable");
     while let Some(entry) = entries.next_entry().await.expect("read LEVELS_DIR") {
         let program_dir = entry.path().join("program");
         let Ok(source) = tokio::fs::read_to_string(program_dir.join("src/lib.rs")).await else {
@@ -363,39 +381,15 @@ async fn load_levels(levels_dir: &Path, work_root: &Path) -> HashMap<String, Lev
         let description = tokio::fs::read_to_string(entry.path().join("description.md"))
             .await
             .unwrap_or_default();
-
-        let level_work = work_root.join(&id);
-        let work_dir = level_work.join("program");
-        if !work_dir.exists() {
-            tokio::fs::create_dir_all(&level_work).await.expect("create work dir");
-            let copied = Command::new("cp").arg("-a").arg(&program_dir).arg(&level_work).status().await;
-            assert!(copied.is_ok_and(|s| s.success()), "could not copy {id} into the work dir");
-        }
-
-        println!("warming {id} (a cold build can take a minute)...");
-        let started = Instant::now();
-        match tokio::time::timeout(Duration::from_secs(600), warm(&work_dir, &source)).await {
-            Ok(Ok(())) => println!("warmed {id} in {:.1}s", started.elapsed().as_secs_f32()),
-            Ok(Err(message)) => panic!("level {id} does not build:\n{message}"),
-            Err(_) => panic!("level {id} warm-up timed out"),
-        }
-        levels.insert(id, Level { description, source, work_dir });
+        levels.insert(
+            id,
+            Level {
+                description,
+                source,
+            },
+        );
     }
     levels
-}
-
-async fn warm(work_dir: &Path, source: &str) -> Result<(), String> {
-    tokio::fs::write(work_dir.join("src/lib.rs"), source).await.map_err(|e| e.to_string())?;
-    let output = sandboxed_command("cargo-build-sbf")
-        .current_dir(work_dir)
-        .output()
-        .await
-        .map_err(|e| format!("could not run cargo-build-sbf (is it on PATH?): {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
-    }
 }
 
 fn env_path(key: &str, default: &str) -> PathBuf {
@@ -405,18 +399,31 @@ fn env_path(key: &str, default: &str) -> PathBuf {
 #[tokio::main]
 async fn main() {
     let levels_dir = env_path("LEVELS_DIR", "levels");
-    let work_root = env_path("WORK_DIR", ".work");
-    let grader = env_path("GRADER_BIN", "target/release/grader");
     let port = env::var("PORT").unwrap_or_else(|_| "8787".to_string());
-
-    let grader = grader.canonicalize().expect("GRADER_BIN exists (cargo build --release -p grader)");
-    tokio::fs::create_dir_all(&work_root).await.expect("create WORK_DIR");
-    let work_root = work_root.canonicalize().expect("WORK_DIR resolves");
-    let levels = load_levels(&levels_dir, &work_root).await;
-    assert!(!levels.is_empty(), "no levels found in {}", levels_dir.display());
+    let sandbox = match Sandbox::discover().await {
+        Ok(sandbox) => {
+            println!("local submission sandbox is ready");
+            Some(Arc::new(sandbox))
+        }
+        Err(error) => {
+            eprintln!("submissions disabled: {error}");
+            None
+        }
+    };
+    let levels = load_levels(&levels_dir).await;
+    assert!(
+        !levels.is_empty(),
+        "no levels found in {}",
+        levels_dir.display()
+    );
 
     let (queue, mut jobs) = mpsc::channel::<Job>(QUEUE_CAPACITY);
-    let app = Arc::new(App { levels, jobs: Mutex::new(HashMap::new()), queue, grader });
+    let app = Arc::new(App {
+        sandbox,
+        levels,
+        jobs: Mutex::new(HashMap::new()),
+        queue,
+    });
 
     let worker_app = app.clone();
     tokio::spawn(async move {
@@ -434,7 +441,73 @@ async fn main() {
         .with_state(app);
 
     let address = format!("0.0.0.0:{port}");
-    let listener = tokio::net::TcpListener::bind(&address).await.expect("bind port");
+    let listener = tokio::net::TcpListener::bind(&address)
+        .await
+        .expect("bind port");
     println!("api listening on http://{address}");
     axum::serve(listener, router).await.expect("server runs");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(sandbox_ready: bool) -> (Arc<App>, mpsc::Receiver<Job>) {
+        let (queue, jobs) = mpsc::channel(QUEUE_CAPACITY);
+        let levels = HashMap::from([(
+            "test-level".into(),
+            Level {
+                description: String::new(),
+                source: String::new(),
+            },
+        )]);
+        (
+            Arc::new(App {
+                sandbox: sandbox_ready.then(|| Arc::new(Sandbox::test_config())),
+                levels,
+                jobs: Mutex::new(HashMap::new()),
+                queue,
+            }),
+            jobs,
+        )
+    }
+
+    #[tokio::test]
+    async fn disabled_submissions_never_reach_worker() {
+        let (app, mut queue) = app(false);
+        let result = submit(
+            State(app.clone()),
+            Json(SubmitRequest {
+                level: "test-level".into(),
+                source: "compile_error!(include_str!(\"/etc/passwd\"));".into(),
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err((StatusCode::SERVICE_UNAVAILABLE, _))));
+        assert!(matches!(
+            queue.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(app.jobs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ready_sandbox_accepts_jobs_without_running_them_in_the_api() {
+        let (app, mut queue) = app(true);
+        let result = submit(
+            State(app.clone()),
+            Json(SubmitRequest {
+                level: "test-level".into(),
+                source: "// trusted demo source".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let job = queue.try_recv().unwrap();
+        assert_eq!(job.id, result.0.id);
+        assert_eq!(job.source, "// trusted demo source");
+        assert!(app.jobs.lock().unwrap().contains_key(&job.id));
+    }
 }

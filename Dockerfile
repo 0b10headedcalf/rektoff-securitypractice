@@ -3,7 +3,8 @@
 # frontend. Build from the repo root:
 #
 #   docker build -t rektoff-practice .
-#   docker run --rm -p 3000:3000 --memory 4g --cpus 4 --pids-limit 512 rektoff-practice
+#   docker build -f Dockerfile.sandbox -t rektoff-sandbox:local .
+#   See README.md for controller Docker socket access.
 #
 # Each level's checks are compiled into the grader in the first stage. The
 # level folders are copied into the final image as they are.
@@ -11,8 +12,10 @@
 ARG RUST_VERSION=1.99
 ARG BUN_VERSION=1.3
 ARG SOLANA_VERSION=4.1.2
+ARG DOCKER_VERSION=29
 
 FROM oven/bun:${BUN_VERSION} AS bun
+FROM docker:${DOCKER_VERSION}-cli AS docker-cli
 
 # ---- Stage 1: compile the API and the grader -------------------------------
 FROM rust:${RUST_VERSION}-bookworm AS builder
@@ -54,8 +57,13 @@ RUN cd frontend && bun install --frozen-lockfile --production
 COPY --chown=app:app frontend/ frontend/
 COPY --chown=app:app start.sh ./
 
+# Only the trusted API controller gets daemon access. The disposable worker
+# image removes this client and never receives a daemon socket or host mount.
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
+
 ENV API_BIN=/app/bin/api \
     GRADER_BIN=/app/bin/grader \
+    WORK_DIR=/home/app/.work \
     CARGO_NET_OFFLINE=true \
     WEB_PORT=3000
 EXPOSE 3000
